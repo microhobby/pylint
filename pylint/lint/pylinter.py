@@ -10,6 +10,7 @@ import contextlib
 import functools
 import os
 import sys
+import re
 import tokenize
 import traceback
 from collections import defaultdict
@@ -963,6 +964,21 @@ class PyLinter(
         """Remove braces and semicolons from the input data."""
         return data.replace('{', '').replace('}', '').replace(';', '')
 
+    def _check_missing_semicolons(self, code: str) -> str:
+        # Split the code into lines
+        lines = code.split('\n')
+        missing_semicolons = []
+
+        # Define a regex pattern to match lines that should end with a semicolon
+        pattern = re.compile(r'^[^#]*[^;\s{]\s*$')
+
+        for lineno, line in enumerate(lines, start=1):
+            # Check if the line matches the pattern and does not end with a brace
+            if pattern.match(line) and not line.strip().endswith(('}', '{')):
+                missing_semicolons.append((lineno, line))
+
+        return missing_semicolons
+
     def get_ast(
         self, filepath: str, modname: str, data: str | None = None
     ) -> nodes.Module | None:
@@ -979,6 +995,18 @@ class PyLinter(
             if data is None:
                 with open(filepath, 'r') as file:
                     data = file.read()
+
+            # check first for missing semicolons
+            missing_semicolons = self._check_missing_semicolons(data)
+            for lineno, line in missing_semicolons:
+                self.add_message(
+                    "syntax-error",
+                    line=lineno,
+                    col_offset=len(line),
+                    args=f"Missing semicolon at the end of line",
+                    confidence=HIGH,
+                )
+
             data = self._remove_braces_and_semicolons(data)
             return astroid.builder.AstroidBuilder(MANAGER).string_build(
                 data, modname, filepath
