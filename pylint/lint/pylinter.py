@@ -959,6 +959,10 @@ class PyLinter(
         for checker in reversed(_checkers):
             checker.close()
 
+    def _remove_braces_and_semicolons(self, data: str) -> str:
+        """Remove braces and semicolons from the input data."""
+        return data.replace('{', '').replace('}', '').replace(';', '')
+
     def get_ast(
         self, filepath: str, modname: str, data: str | None = None
     ) -> nodes.Module | None:
@@ -973,7 +977,9 @@ class PyLinter(
         """
         try:
             if data is None:
-                return MANAGER.ast_from_file(filepath, modname, source=True)
+                with open(filepath, 'r') as file:
+                    data = file.read()
+            data = self._remove_braces_and_semicolons(data)
             return astroid.builder.AstroidBuilder(MANAGER).string_build(
                 data, modname, filepath
             )
