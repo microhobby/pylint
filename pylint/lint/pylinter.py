@@ -12,6 +12,7 @@ import os
 import sys
 import re
 import tokenize
+import io
 import traceback
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -961,8 +962,17 @@ class PyLinter(
             checker.close()
 
     def _remove_braces_and_semicolons(self, data: str) -> str:
-        """Remove braces and semicolons from the input data."""
-        return data.replace('{', '').replace('}', '').replace(';', '')
+        """Remove braces and semicolons from the input data, except in dicts and f-strings."""
+
+        result = []
+        tokens = tokenize.generate_tokens(io.StringIO(data).readline)
+        for token in tokens:
+            token_type, token_string, _, _, _ = token
+            if token_type == tokenize.OP and token_string in {'{', '}', ';'}:
+                continue  # Remove semicolons and braces
+            result.append(token)
+
+        return tokenize.untokenize(result)
 
     def _check_missing_semicolons(self, code: str) -> str:
         # Split the code into lines
