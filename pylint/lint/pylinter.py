@@ -20,7 +20,7 @@ from io import TextIOWrapper
 from pathlib import Path
 from re import Pattern
 from types import ModuleType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import astroid
 from astroid import nodes
@@ -974,7 +974,7 @@ class PyLinter(
 
         return tokenize.untokenize(result)
 
-    def _check_missing_semicolons(self, code: str) -> str:
+    def _check_missing_semicolons(self, code: str) -> list[tuple[int, str]]:
         # Split the code into lines
         lines = code.split('\n')
         missing_semicolons = []
@@ -1022,12 +1022,12 @@ class PyLinter(
                 data, modname, filepath
             )
         except astroid.AstroidSyntaxError as ex:
-            line = getattr(ex.error, "lineno", None)
-            if line is None:
-                line = 0
+            lineno = cast(int, getattr(ex.error, "lineno", None))
+            if lineno is None:
+                lineno = 0
             self.add_message(
                 "syntax-error",
-                line=line,
+                line=lineno,
                 col_offset=getattr(ex.error, "offset", None),
                 args=f"Parsing failed: '{ex.error}'",
                 confidence=HIGH,
