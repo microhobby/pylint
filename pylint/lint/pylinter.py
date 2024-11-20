@@ -989,6 +989,38 @@ class PyLinter(
 
         return missing_semicolons
 
+    def _check_braces(self, data):
+        open_braces = []
+        close_braces = []
+        lines = data.split('\n')
+
+        for lineno, line in enumerate(lines, start=1):
+            stripped_line = line.strip()
+            if '{' in stripped_line:
+                open_braces.append((lineno, line))
+            if '}' in stripped_line:
+                close_braces.append((lineno, line))
+
+        if len(open_braces) != len(close_braces):
+            if len(open_braces) > len(close_braces):
+                for lineno, line in open_braces[len(close_braces):]:
+                    self.add_message(
+                    "syntax-error",
+                    line=lineno,
+                    col_offset=len(line),
+                    args=f"Missing closing brace for opening brace at line {lineno}",
+                    confidence=HIGH,
+                )
+            else:
+                for lineno, line in close_braces[len(open_braces):]:
+                    self.add_message(
+                    "syntax-error",
+                    line=lineno,
+                    col_offset=len(line),
+                    args=f"Missing opening brace for closing brace at line {lineno}",
+                    confidence=HIGH,
+                )
+
     def get_ast(
         self, filepath: str, modname: str, data: str | None = None
     ) -> nodes.Module | None:
@@ -1016,6 +1048,11 @@ class PyLinter(
                     args=f"Missing semicolon at the end of line",
                     confidence=HIGH,
                 )
+
+            # check also for missing open or close braces
+            if data.count('{') != data.count('}'):
+                self._check_braces(data)
+                return None
 
             data = self._remove_braces_and_semicolons(data)
             return astroid.builder.AstroidBuilder(MANAGER).string_build(
