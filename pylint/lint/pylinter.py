@@ -22,6 +22,10 @@ from typing import Any, Protocol
 
 import astroid
 from astroid import nodes
+from xonsh.execer import Execer
+from xonsh.built_ins import XSH
+from xonsh.main import setup
+import ast
 
 from pylint import checkers, exceptions, interfaces, reporters
 from pylint.checkers.base_checker import BaseChecker
@@ -68,6 +72,180 @@ from pylint.typing import (
 from pylint.utils import ASTWalker, FileState, LinterStats, utils
 
 MANAGER = astroid.MANAGER
+
+
+## CUSTOM XONSH STUFF
+def _analyze_xonsh_file(file_path = None, file_str = None):
+    """Analyze a .xsh file and identify non-Python lines."""
+
+    # Setup xonsh environment if not already done
+    if not hasattr(XSH, 'execer') or XSH.execer is None:
+        setup(shell_type="none")
+
+    content = ""
+    if file_path is None:
+        file_path = "_pylint_"
+        content = file_str
+    else:
+        # Read the file
+        with open(file_path, 'r') as f:
+            content = f.read()
+
+    # Create an execer instance
+    execer = Execer(filename=file_path, debug_level=0)
+
+    # Parse with context-aware transformation
+    try:
+        # Create a basic context (builtin functions and variables)
+        ctx = set(dir(__builtins__))
+
+        # Parse the content - this will transform shell commands to subprocess calls
+        tree = execer.parse(content, ctx, mode="exec", filename=file_path, transform=True)
+
+        if tree is None:
+            print("No executable code found")
+            return
+
+        # Analyze the AST to find subprocess calls
+        analyzer = XonshCodeAnalyzer(content)
+        analyzer.visit(tree)
+
+        return analyzer.get_results()
+
+    except SyntaxError as e:
+        raise astroid.AstroidSyntaxError(
+            f"Syntax error in {file_path}: {e}",
+            modname=file_path,
+            error=e,
+            path=file_path,
+        )
+
+class XonshCodeAnalyzer(ast.NodeVisitor):
+    """AST visitor to identify xonsh-specific constructs."""
+
+    def __init__(self, source_code):
+        self.source_lines = source_code.splitlines()
+        self.shell_lines = set()
+        self.env_var_lines = set()
+        self.subprocess_lines = set()
+        self.multiline_commands = set()  # Track multiline command ranges
+
+    def visit_Call(self, node):
+        """Visit function calls to identify subprocess calls."""
+        # Check for subprocess calls (these are shell commands)
+        if (hasattr(node.func, 'attr')):
+            if hasattr(node, 'lineno') and node.func.attr == "subproc_captured_hiddenobject":
+                start_line = node.lineno
+                end_line = getattr(node, 'end_lineno', start_line)
+
+                # For multiline commands, mark all lines in the range
+                if end_line and end_line > start_line:
+                    for line_num in range(start_line, end_line + 1):
+                        self.subprocess_lines.add(line_num)
+                        self.multiline_commands.add(line_num)
+                else:
+                    self.subprocess_lines.add(start_line)
+
+                # Also check for line continuations manually
+                self._mark_continuation_lines(start_line)
+
+        self.generic_visit(node)
+
+    def _mark_continuation_lines(self, start_line):
+        """Mark lines that are part of a multiline command using backslash continuation."""
+        if start_line > len(self.source_lines):
+            return
+
+        current_line = start_line - 1  # Convert to 0-based indexing
+
+        # Look backward to find the actual start of the command
+        while current_line > 0:
+            line_content = self.source_lines[current_line - 1].rstrip()
+            if line_content.endswith('\\'):
+                self.subprocess_lines.add(current_line)  # Add 1-based line number
+                current_line -= 1
+            else:
+                break
+
+        # Look forward to find continuation lines
+        current_line = start_line - 1  # Reset to original line (0-based)
+        while current_line < len(self.source_lines):
+            line_content = self.source_lines[current_line].rstrip()
+            if line_content.endswith('\\'):
+                self.subprocess_lines.add(current_line + 1)  # Add 1-based line number
+                # Check the next line too
+                if current_line + 1 < len(self.source_lines):
+                    self.subprocess_lines.add(current_line + 2)  # Next line is also part of command
+                current_line += 1
+            else:
+                # This is the last line of the command
+                self.subprocess_lines.add(current_line + 1)  # Add 1-based line number
+                break
+
+    def visit_Subscript(self, node):
+        """Visit subscript operations to identify environment variable access."""
+        # Check for environment variable access like $VAR or ${VAR}
+        if (hasattr(node.value, 'attr') and
+            hasattr(node.value.value, 'id') and
+            node.value.value.id == '__xonsh__' and
+            node.value.attr == 'env'):
+
+            if hasattr(node, 'lineno'):
+                start_line = node.lineno
+                end_line = getattr(node, 'end_lineno', start_line)
+
+                # Handle multiline environment variable access
+                if end_line and end_line > start_line:
+                    for line_num in range(start_line, end_line + 1):
+                        self.env_var_lines.add(line_num)
+                else:
+                    self.env_var_lines.add(start_line)
+
+        self.generic_visit(node)
+
+    def visit_Assign(self, node):
+        """Visit assignments to identify environment variable assignments."""
+        # Check for environment variable assignments
+        for target in node.targets:
+            if (isinstance(target, ast.Subscript) and
+                hasattr(target.value, 'attr') and
+                hasattr(target.value.value, 'id') and
+                target.value.value.id == '__xonsh__' and
+                target.value.attr == 'env'):
+
+                if hasattr(node, 'lineno'):
+                    start_line = node.lineno
+                    end_line = getattr(node, 'end_lineno', start_line)
+
+                    # Handle multiline environment variable assignments
+                    if end_line and end_line > start_line:
+                        for line_num in range(start_line, end_line + 1):
+                            self.env_var_lines.add(line_num)
+                    else:
+                        self.env_var_lines.add(start_line)
+
+        self.generic_visit(node)
+
+    def get_results(self):
+        """Return analysis results."""
+        all_non_python = self.shell_lines | self.env_var_lines | self.subprocess_lines
+
+        results = {
+            'total_lines': len(self.source_lines),
+            'shell_command_lines': sorted(self.subprocess_lines),
+            'env_var_lines': sorted(self.env_var_lines),
+            'all_non_python_lines': sorted(all_non_python),
+            'pure_python_lines': [],
+            'multiline_commands': sorted(self.multiline_commands)
+        }
+
+        # Identify pure Python lines (lines not in any non-Python category)
+        for i, line in enumerate(self.source_lines, 1):
+            if line.strip() and i not in all_non_python:
+                results['pure_python_lines'].append(i)
+
+        return results
+## CUSTOM XONSH STUFF
 
 
 class GetAstProtocol(Protocol):
@@ -973,7 +1151,29 @@ class PyLinter(
         """
         try:
             if data is None:
-                return MANAGER.ast_from_file(filepath, modname, source=True)
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = f.read()
+                _data_lines = data.splitlines()
+
+                _xonsh = _analyze_xonsh_file(file_path=filepath, file_str=None)
+
+                # comment the lines
+                if _xonsh != None and len(_xonsh['all_non_python_lines']) > 0:
+                    for _line in _xonsh['all_non_python_lines']:
+                        _data_lines[_line -1] = "# " + _data_lines[_line -1]
+
+                data = "\n".join(_data_lines)
+            else:
+                _data_lines = data.splitlines()
+                _xonsh = _analyze_xonsh_file(file_path=None, file_str=data)
+
+                # comment the lines
+                if _xonsh != None and len(_xonsh['all_non_python_lines']) > 0:
+                    for _line in _xonsh['all_non_python_lines']:
+                        _data_lines[_line -1] = "# " + _data_lines[_line -1]
+
+                data = "\n".join(_data_lines)
+
             return astroid.builder.AstroidBuilder(MANAGER).string_build(
                 data, modname, filepath
             )

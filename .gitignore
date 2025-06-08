@@ -27,3 +27,5 @@ build-stamp
 .pytest_cache/
 .mypy_cache/
 .benchmarks/
+.venv/
+*.egg-info/
