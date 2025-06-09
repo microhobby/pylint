@@ -130,11 +130,19 @@ class XonshCodeAnalyzer(ast.NodeVisitor):
         self.subprocess_lines = set()
         self.multiline_commands = set()  # Track multiline command ranges
 
+        # Pre-scan for command substitution patterns that might not show up in AST
+        self._prescan_command_substitutions()
+
     def visit_Call(self, node):
         """Visit function calls to identify subprocess calls."""
         # Check for subprocess calls (these are shell commands)
         if (hasattr(node.func, 'attr')):
-            if hasattr(node, 'lineno') and node.func.attr == "subproc_captured_hiddenobject":
+            # Handle both regular subprocess calls and command substitution
+            if (hasattr(node, 'lineno') and
+                (node.func.attr == "subproc_captured_hiddenobject" or
+                node.func.attr == "subproc_captured_stdout" or
+                node.func.attr == "subproc_captured_object")):
+
                 start_line = node.lineno
                 end_line = getattr(node, 'end_lineno', start_line)
 
@@ -149,15 +157,37 @@ class XonshCodeAnalyzer(ast.NodeVisitor):
                 # Also check for line continuations manually
                 self._mark_continuation_lines(start_line)
 
+        # Also check for function calls that might be command substitutions
+        elif (hasattr(node.func, 'id') and
+            hasattr(node, 'lineno')):
+            # Check if this looks like a command substitution pattern
+            func_name = getattr(node.func, 'id', '')
+            if 'subproc' in func_name.lower():
+                start_line = node.lineno
+                end_line = getattr(node, 'end_lineno', start_line)
+
+                if end_line and end_line > start_line:
+                    for line_num in range(start_line, end_line + 1):
+                        self.subprocess_lines.add(line_num)
+                        self.multiline_commands.add(line_num)
+                else:
+                    self.subprocess_lines.add(start_line)
+
+                self._mark_continuation_lines(start_line)
+
         self.generic_visit(node)
 
     def _mark_continuation_lines(self, start_line):
-        """Mark lines that are part of a multiline command using backslash continuation."""
+        """Mark lines that are part of a multiline command using backslash continuation or parentheses."""
         if start_line > len(self.source_lines):
             return
 
         current_line = start_line - 1  # Convert to 0-based indexing
 
+        # First, check if this is a $(...) command substitution that spans multiple lines
+        self._mark_command_substitution_lines(start_line)
+
+        # Then handle backslash continuations
         # Look backward to find the actual start of the command
         while current_line > 0:
             line_content = self.source_lines[current_line - 1].rstrip()
@@ -180,6 +210,52 @@ class XonshCodeAnalyzer(ast.NodeVisitor):
             else:
                 # This is the last line of the command
                 self.subprocess_lines.add(current_line + 1)  # Add 1-based line number
+                break
+
+    def _mark_command_substitution_lines(self, start_line):
+        """Mark all lines that are part of a command substitution $(...) block."""
+        if start_line > len(self.source_lines):
+            return
+
+        # Look for the pattern where a line contains $( and we need to find the matching )
+        start_idx = start_line - 1  # Convert to 0-based
+
+        # Look backward to find the start of the $( construct
+        actual_start = start_idx
+        for i in range(start_idx, -1, -1):
+            line = self.source_lines[i]
+            if '$(' in line or '@(' in line or '!(' in line:
+                actual_start = i
+                break
+            # If we find a line that doesn't seem to be part of a continuation, stop
+            if not line.rstrip().endswith('\\') and '=' not in line:
+                break
+
+        # Now find the matching closing parenthesis
+        # Simple approach: look for $(...) blocks and mark all lines until the closing )
+        paren_count = 0
+        found_start = False
+
+        for i in range(actual_start, len(self.source_lines)):
+            line = self.source_lines[i]
+
+            # Count command substitution starts
+            for j, char in enumerate(line):
+                if char == '(' and j > 0:
+                    prev_char = line[j-1]
+                    if prev_char in ['$', '@', '!']:
+                        paren_count += 1
+                        found_start = True
+                elif char == ')' and found_start:
+                    paren_count -= 1
+
+            # Mark this line as a subprocess line
+            if found_start:
+                self.subprocess_lines.add(i + 1)  # Convert to 1-based
+                self.multiline_commands.add(i + 1)
+
+            # If we've closed all parentheses, we're done
+            if found_start and paren_count == 0:
                 break
 
     def visit_Subscript(self, node):
@@ -245,6 +321,52 @@ class XonshCodeAnalyzer(ast.NodeVisitor):
                 results['pure_python_lines'].append(i)
 
         return results
+
+    def _prescan_command_substitutions(self):
+        """Pre-scan the source code to find command substitution patterns."""
+        i = 0
+        while i < len(self.source_lines):
+            line = self.source_lines[i]
+
+            # Look for command substitution patterns: $(...), @(...), !(...)
+            if any(pattern in line for pattern in ['$(', '@(', '!(']):
+                # Find the complete command substitution block
+                paren_count = 0
+                found_start = False
+
+                # Process from current line onwards to find the complete block
+                j = i
+                while j < len(self.source_lines):
+                    current_line = self.source_lines[j]
+
+                    # Count command substitution starts and regular parentheses
+                    for k, char in enumerate(current_line):
+                        if char == '(' and k > 0:
+                            prev_char = current_line[k-1]
+                            if prev_char in ['$', '@', '!']:
+                                paren_count += 1
+                                found_start = True
+                        elif char == ')' and found_start:
+                            paren_count -= 1
+
+                    # Mark this line as part of a command substitution
+                    if found_start:
+                        self.subprocess_lines.add(j + 1)  # Convert to 1-based
+                        self.multiline_commands.add(j + 1)
+
+                    # If we've balanced all parentheses, we're done with this block
+                    if found_start and paren_count == 0:
+                        i = j + 1  # Continue from the next line after this block
+                        break
+
+                    j += 1
+
+                # If we didn't find a complete block, continue from next line
+                if j >= len(self.source_lines):
+                    i += 1
+            else:
+                i += 1
+
 ## CUSTOM XONSH STUFF
 
 
